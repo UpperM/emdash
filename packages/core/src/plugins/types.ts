@@ -763,6 +763,8 @@ export interface PublicPageContext {
 	};
 	/** Site name for structured data and og:site_name */
 	siteName?: string;
+	/** Public-facing site URL (origin) for structured data */
+	siteUrl?: string;
 }
 
 // ── page:metadata ───────────────────────────────────────────────
