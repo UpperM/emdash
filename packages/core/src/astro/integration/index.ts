@@ -90,17 +90,29 @@ export function emdash(config: EmDashConfig = {}): AstroIntegration {
 		}
 	}
 
-	if (resolvedConfig.passkeyPublicOrigin) {
-		const raw = resolvedConfig.passkeyPublicOrigin;
+	// Resolve siteUrl: explicit config > EMDASH_SITE_URL env > SITE_URL env
+	// import.meta.env may be undefined during config loading (before Vite is initialized)
+	if (!resolvedConfig.siteUrl && typeof import.meta.env !== "undefined") {
+		// eslint-disable-next-line typescript-eslint(no-unsafe-type-assertion) -- import.meta.env is typed as ImportMetaEnv but we need string access for EMDASH_SITE_URL / SITE_URL
+		const env = import.meta.env as Record<string, string | undefined>;
+		const envSiteUrl = env.EMDASH_SITE_URL || env.SITE_URL;
+		if (envSiteUrl) {
+			resolvedConfig.siteUrl = envSiteUrl;
+		}
+	}
+
+	if (resolvedConfig.siteUrl) {
+		const raw = resolvedConfig.siteUrl;
 		try {
 			const parsed = new URL(raw);
 			if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-				throw new Error(`passkeyPublicOrigin must be http or https (got ${parsed.protocol})`);
+				throw new Error(`siteUrl must be http or https (got ${parsed.protocol})`);
 			}
-			resolvedConfig.passkeyPublicOrigin = parsed.origin;
+			// Always store origin-normalized value (no path) — security invariant L-1
+			resolvedConfig.siteUrl = parsed.origin;
 		} catch (e) {
 			if (e instanceof TypeError) {
-				throw new Error(`Invalid passkeyPublicOrigin: "${raw}"`, { cause: e });
+				throw new Error(`Invalid siteUrl: "${raw}"`, { cause: e });
 			}
 			throw e;
 		}
@@ -152,7 +164,7 @@ export function emdash(config: EmDashConfig = {}): AstroIntegration {
 		storage: resolvedConfig.storage,
 		auth: resolvedConfig.auth,
 		marketplace: resolvedConfig.marketplace,
-		passkeyPublicOrigin: resolvedConfig.passkeyPublicOrigin,
+		siteUrl: resolvedConfig.siteUrl,
 	};
 
 	// Determine auth mode for route injection
@@ -184,8 +196,12 @@ export function emdash(config: EmDashConfig = {}): AstroIntegration {
 					};
 				}
 
-				// Update Vite config with virtual modules and other settings
+				// Let Astro trust X-Forwarded-* headers so its built-in origin
+				// check works behind reverse proxies. Safe: browsers can't inject
+				// X-Forwarded-Host cross-origin (CORS preflight blocks custom
+				// headers), and EmDash has its own CSRF layer on top.
 				updateConfig({
+					security: { allowedDomains: [{}] },
 					vite: createViteConfig(
 						{
 							serializableConfig,
