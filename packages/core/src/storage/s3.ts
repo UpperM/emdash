@@ -15,6 +15,7 @@ import {
 	type ListObjectsV2Response,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { z } from "zod";
 
 import type {
 	Storage,
@@ -27,6 +28,95 @@ import type {
 	SignedUploadOptions,
 } from "./types.js";
 import { EmDashStorageError } from "./types.js";
+
+const ENV_KEYS = {
+	endpoint: "S3_ENDPOINT",
+	bucket: "S3_BUCKET",
+	accessKeyId: "S3_ACCESS_KEY_ID",
+	secretAccessKey: "S3_SECRET_ACCESS_KEY",
+	region: "S3_REGION",
+	publicUrl: "S3_PUBLIC_URL",
+} as const satisfies Record<keyof S3StorageConfig, string>;
+
+function fail(msg: string): never {
+	throw new EmDashStorageError(msg, "MISSING_S3_CONFIG");
+}
+
+const s3ConfigSchema = z.object({
+	endpoint: z.url({ protocol: /^https?$/, error: "is not a valid http/https URL" }).optional(),
+	bucket: z.string().optional(),
+	accessKeyId: z.string().optional(),
+	secretAccessKey: z.string().optional(),
+	region: z.string().optional(),
+	publicUrl: z.string().optional(),
+});
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function isConfigKey(key: unknown): key is keyof S3StorageConfig {
+	return typeof key === "string" && key in ENV_KEYS;
+}
+
+/** Treat empty strings and undefined as absent so `S3_X=""` / `s3({ x: "" })` never mask config, and absent keys don't clobber env during merge. */
+function stripAbsent(raw: unknown): Record<string, unknown> {
+	if (!isRecord(raw)) return {};
+	const out: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(raw)) {
+		if (value === "" || value === undefined) continue;
+		out[key] = value;
+	}
+	return out;
+}
+
+function parseSource(raw: unknown, source: "env" | "explicit"): Partial<S3StorageConfig> {
+	const result = s3ConfigSchema.safeParse(stripAbsent(raw));
+	if (result.success) return result.data;
+	const issue = result.error.issues[0];
+	const pathKey = issue?.path[0];
+	if (!issue || !isConfigKey(pathKey)) fail("S3 config validation failed");
+	const label = source === "env" ? ENV_KEYS[pathKey] : `s3({ ${pathKey} })`;
+	fail(`${label} ${issue.message}`);
+}
+
+function readEnv(): Partial<S3StorageConfig> {
+	if (typeof process === "undefined" || !process.env) return {};
+	const raw: Record<string, unknown> = {};
+	for (const [field, envKey] of Object.entries(ENV_KEYS)) {
+		raw[field] = process.env[envKey];
+	}
+	return parseSource(raw, "env");
+}
+
+export function resolveS3Config(partial: Record<string, unknown>): S3StorageConfig {
+	const env = readEnv();
+	const explicit = parseSource(partial, "explicit");
+	const merged = { ...env, ...explicit };
+
+	const endpoint = merged.endpoint;
+	const bucket = merged.bucket;
+	if (!endpoint || !bucket) {
+		const missing: string[] = [];
+		if (!endpoint) missing.push(`endpoint: set ${ENV_KEYS.endpoint} or pass endpoint to s3({...})`);
+		if (!bucket) missing.push(`bucket: set ${ENV_KEYS.bucket} or pass bucket to s3({...})`);
+		fail(`missing required S3 config: ${missing.join("; ")}`);
+	}
+	const accessKeyId = merged.accessKeyId;
+	const secretAccessKey = merged.secretAccessKey;
+	if (accessKeyId && !secretAccessKey) {
+		fail(
+			`S3 credentials incomplete: accessKeyId is set but secretAccessKey is missing (set ${ENV_KEYS.secretAccessKey} or pass secretAccessKey to s3({...}))`,
+		);
+	}
+	if (secretAccessKey && !accessKeyId) {
+		fail(
+			`S3 credentials incomplete: secretAccessKey is set but accessKeyId is missing (set ${ENV_KEYS.accessKeyId} or pass accessKeyId to s3({...}))`,
+		);
+	}
+
+	return { ...merged, endpoint, bucket };
+}
 
 const TRAILING_SLASH_PATTERN = /\/$/;
 
@@ -49,16 +139,21 @@ export class S3Storage implements Storage {
 		this.publicUrl = config.publicUrl;
 		this.endpoint = config.endpoint;
 
+		// eslint-disable-next-line typescript-eslint(no-unsafe-type-assertion) -- SDK type declares credentials as required but accepts omission at runtime when the caller provides credentials through an alternative mechanism
 		this.client = new S3Client({
 			endpoint: config.endpoint,
 			region: config.region || "auto",
-			credentials: {
-				accessKeyId: config.accessKeyId,
-				secretAccessKey: config.secretAccessKey,
-			},
+			...(config.accessKeyId && config.secretAccessKey
+				? {
+						credentials: {
+							accessKeyId: config.accessKeyId,
+							secretAccessKey: config.secretAccessKey,
+						},
+					}
+				: {}),
 			// Required for R2 and some S3-compatible services
 			forcePathStyle: true,
-		});
+		} as ConstructorParameters<typeof S3Client>[0]);
 	}
 
 	async upload(options: {
@@ -238,26 +333,9 @@ export class S3Storage implements Storage {
 
 /**
  * Create S3 storage adapter
- * This is the factory function called at runtime
+ * This is the factory function called at runtime.
+ * Config fields are merged with S3_* env vars; env vars fill in any missing fields.
  */
 export function createStorage(config: Record<string, unknown>): Storage {
-	const { endpoint, bucket, accessKeyId, secretAccessKey, region, publicUrl } = config;
-	if (
-		typeof endpoint !== "string" ||
-		typeof bucket !== "string" ||
-		typeof accessKeyId !== "string" ||
-		typeof secretAccessKey !== "string"
-	) {
-		throw new Error(
-			"S3Storage requires 'endpoint', 'bucket', 'accessKeyId', and 'secretAccessKey' string config values",
-		);
-	}
-	return new S3Storage({
-		endpoint,
-		bucket,
-		accessKeyId,
-		secretAccessKey,
-		region: typeof region === "string" ? region : undefined,
-		publicUrl: typeof publicUrl === "string" ? publicUrl : undefined,
-	});
+	return new S3Storage(resolveS3Config(config));
 }
