@@ -1,10 +1,4 @@
-/**
- * Tests for resolveS3Config (packages/core/src/storage/s3.ts)
- *
- * TDD: written before the implementation file exists.
- */
-
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 // The AWS SDK is a "bring-your-own" dependency of emdash core — it is NOT
 // installed in CI. Stub it here so loading s3.ts (which statically imports
@@ -32,7 +26,7 @@ vi.mock("@aws-sdk/s3-request-presigner", () => ({
 	getSignedUrl: () => Promise.resolve("https://signed.example.com/fake"),
 }));
 
-import { resolveS3Config, createStorage } from "../../../src/storage/s3.js";
+import { createStorage, resolveS3Config } from "../../../src/storage/s3.js";
 import { EmDashStorageError } from "../../../src/storage/types.js";
 
 const FULL_ENV = {
@@ -192,13 +186,10 @@ describe("resolveS3Config", () => {
 			expect(() => resolveS3Config({ endpoint: "not-a-url" })).toThrow("s3({ endpoint })");
 		});
 
-		it("invalid S3_ENDPOINT throws even when explicit endpoint is also provided", () => {
-			// Decision (a): invalid env values are surfaced eagerly. Removing the
-			// explicit override later must not silently activate a broken env value.
+		it("malformed S3_ENDPOINT is ignored when explicit endpoint is provided", () => {
 			setEnv({ ...FULL_ENV, S3_ENDPOINT: "not-a-url" });
-			expect(() => resolveS3Config({ endpoint: "https://explicit.example.com" })).toThrow(
-				"S3_ENDPOINT",
-			);
+			const r = resolveS3Config({ endpoint: "https://explicit.example.com" });
+			expect(r.endpoint).toBe("https://explicit.example.com");
 		});
 	});
 

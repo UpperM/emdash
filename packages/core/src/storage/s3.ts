@@ -51,48 +51,40 @@ const s3ConfigSchema = z.object({
 	publicUrl: z.string().optional(),
 });
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
-
 function isConfigKey(key: unknown): key is keyof S3StorageConfig {
 	return typeof key === "string" && key in ENV_KEYS;
 }
 
-/** Treat empty strings and undefined as absent so `S3_X=""` / `s3({ x: "" })` never mask config, and absent keys don't clobber env during merge. */
-function stripAbsent(raw: unknown): Record<string, unknown> {
-	if (!isRecord(raw)) return {};
-	const out: Record<string, unknown> = {};
-	for (const [key, value] of Object.entries(raw)) {
-		if (value === "" || value === undefined) continue;
-		out[key] = value;
-	}
-	return out;
-}
-
-function parseSource(raw: unknown, source: "env" | "explicit"): Partial<S3StorageConfig> {
-	const result = s3ConfigSchema.safeParse(stripAbsent(raw));
-	if (result.success) return result.data;
-	const issue = result.error.issues[0];
-	const pathKey = issue?.path[0];
-	if (!issue || !isConfigKey(pathKey)) fail("S3 config validation failed");
-	const label = source === "env" ? ENV_KEYS[pathKey] : `s3({ ${pathKey} })`;
-	fail(`${label} ${issue.message}`);
-}
-
-function readEnv(): Partial<S3StorageConfig> {
-	if (typeof process === "undefined" || !process.env) return {};
+/**
+ * Build the merged config: for each field, use the explicit value if present,
+ * otherwise fall back to the corresponding S3_* env var.  Validate once on the
+ * final merged result so a malformed env var never breaks the build when the
+ * caller provides that field explicitly.
+ */
+export function resolveS3Config(partial: Record<string, unknown>): S3StorageConfig {
 	const raw: Record<string, unknown> = {};
 	for (const [field, envKey] of Object.entries(ENV_KEYS)) {
-		raw[field] = process.env[envKey];
+		const explicit = partial[field];
+		if (explicit !== undefined && explicit !== "") {
+			raw[field] = explicit;
+			continue;
+		}
+		const envVal = typeof process !== "undefined" && process.env ? process.env[envKey] : undefined;
+		if (envVal !== undefined && envVal !== "") {
+			raw[field] = envVal;
+		}
 	}
-	return parseSource(raw, "env");
-}
 
-export function resolveS3Config(partial: Record<string, unknown>): S3StorageConfig {
-	const env = readEnv();
-	const explicit = parseSource(partial, "explicit");
-	const merged = { ...env, ...explicit };
+	const result = s3ConfigSchema.safeParse(raw);
+	if (!result.success) {
+		const issue = result.error.issues[0];
+		const pathKey = issue?.path[0];
+		if (!issue || !isConfigKey(pathKey)) fail("S3 config validation failed");
+		const fromExplicit = partial[pathKey] !== undefined && partial[pathKey] !== "";
+		const label = fromExplicit ? `s3({ ${pathKey} })` : ENV_KEYS[pathKey];
+		fail(`${label} ${issue.message}`);
+	}
+	const merged = result.data;
 
 	const endpoint = merged.endpoint;
 	const bucket = merged.bucket;
@@ -139,7 +131,6 @@ export class S3Storage implements Storage {
 		this.publicUrl = config.publicUrl;
 		this.endpoint = config.endpoint;
 
-		// eslint-disable-next-line typescript-eslint(no-unsafe-type-assertion) -- SDK type declares credentials as required but accepts omission at runtime when the caller provides credentials through an alternative mechanism
 		this.client = new S3Client({
 			endpoint: config.endpoint,
 			region: config.region || "auto",
